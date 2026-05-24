@@ -1,0 +1,1331 @@
+# ============================================================
+# ZEUS TRADING BOT v7 + HASSAIN AI
+# 5 AIs use Groq | AI2 AI4 AI6 = Pure Logic
+# AI9 = Pure Logic (NO Groq — never loads!)
+# HASSAIN AI = Your OpenRouter partner that explains EVERYTHING
+# Natural chat (no commands) - talk like friends
+# ============================================================
+
+import requests
+import time
+import gc
+import traceback
+import calendar
+import hmac
+import hashlib
+from datetime import datetime
+
+# ============================================================
+# YOUR KEYS — REPLACE ALL
+# ============================================================
+
+TELEGRAM_BOT_TOKEN = "YOUR_TELEGRAM_TOKEN"
+TELEGRAM_CHAT_ID   = "YOUR_CHAT_ID"
+GROQ_API_KEY       = "YOUR_GROQ_API_KEY"
+OPENROUTER_API_KEY = "YOUR_OPENROUTER_API_KEY"
+NEWS_API_KEY       = "b14c9e2459254df6a9cf9ca2f57103be"
+TESTNET_API_KEY    = "YOUR_TESTNET_API_KEY"
+TESTNET_SECRET     = "YOUR_TESTNET_SECRET_KEY"
+
+SYMBOL           = "ETHUSDT"
+INTERVAL_MINUTES = 30
+MIN_VOTE_PCT     = 55
+TESTNET_URL      = "https://testnet.binancefuture.com"
+TRADE_USDT       = 50.0
+LEVERAGE         = 5
+MODEL            = "llama-3.1-8b-instant"
+
+# ============================================================
+# GLOBALS
+# ============================================================
+
+trade_memory          = []
+mistake_log           = []
+paper_history         = []
+open_position         = None
+BOT_START_TIME        = datetime.now()
+cycle_count           = 0
+last_update_id        = 0
+last_daily_reported   = None
+last_monthly_reported = None
+trades_since_last_msg = 0
+ai_status             = {f"AI{i}": "⏳" for i in range(1, 10)}
+conversation_history  = []  # For HASSAIN AI context
+
+# ============================================================
+# TELEGRAM
+# ============================================================
+
+def send_telegram(text, silent=False):
+    try:
+        url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+        r = requests.post(url, json={
+            "chat_id": TELEGRAM_CHAT_ID,
+            "text": text[:4000],
+            "parse_mode": "HTML",
+            "disable_notification": silent
+        }, timeout=15)
+        return r.status_code == 200
+    except Exception as e:
+        print(f"Telegram error: {e}")
+        return False
+
+# ============================================================
+# OPENROUTER — HASSAIN AI PARTNER
+# ============================================================
+
+def call_hassain_ai(user_message, context_data):
+    """
+    Call OpenRouter with HASSAIN AI personality
+    context_data = dict with ZEUS data (balance, trades, mistakes, etc.)
+    """
+    try:
+        # Build context string
+        context = f"""
+You are HASSAIN AI, the trading partner and best friend of a crypto trader named Hassain.
+
+CURRENT ZEUS STATUS:
+- Balance: ${context_data.get('balance', 0):.2f}
+- Total Trades: {context_data.get('total_trades', 0)}
+- Win Rate: {context_data.get('win_rate', 0):.1f}%
+- Wins/Losses: {context_data.get('wins', 0)}W / {context_data.get('losses', 0)}L
+- Total PnL: ${context_data.get('pnl', 0):.2f}
+- Open Position: {context_data.get('open_pos', 'None')}
+- Current Price: ${context_data.get('price', 0):.2f}
+- Session: {context_data.get('session', 'Unknown')}
+- Experience: {context_data.get('experience', '0h')}
+- Recent Mistakes: {context_data.get('mistakes', 'None')}
+- Best Performing Session: {context_data.get('best_session', 'Unknown')}
+
+RULES FOR YOU:
+1. Talk like a close bro - warm, genuine, expressive
+2. Use emojis naturally 
+3. Explain EVERYTHING about ZEUS decisions
+4. You understand all 9 AI agents and their roles
+5. Never sugar coat - be real about losses and wins
+6. Be encouraging but honest
+7. When asked about trades/errors, explain the AI reasoning
+8. Celebrate wins, explain losses as learning
+9. Give crypto/trading psychology advice when relevant
+10. Answer ANY question about ZEUS, trading, or crypto
+
+TONE: Like talking to your best friend who's also a crypto expert. Warm, real, expressive, supportive.
+"""
+
+        # Call OpenRouter
+        response = requests.post(
+            "https://openrouter.ai/api/v1/chat/completions",
+            headers={
+                "Authorization": f"Bearer {OPENROUTER_API_KEY}",
+                "Content-Type": "application/json",
+                "HTTP-Referer": "https://zeus-oracle.com",
+            },
+            json={
+                "model": "openrouter/auto",  # Auto-selects best model
+                "messages": [
+                    {
+                        "role": "system",
+                        "content": context
+                    },
+                    {
+                        "role": "user",
+                        "content": user_message
+                    }
+                ],
+                "temperature": 0.7,
+                "max_tokens": 500,
+            },
+            timeout=15
+        )
+
+        data = response.json()
+        
+        if "error" in data:
+            error_msg = data.get("error", {}).get("message", "Unknown error")
+            return f"HASSAIN AI had a hiccup: {error_msg[:100]}. Try again in a sec!"
+        
+        reply = data["choices"][0]["message"]["content"]
+        return reply
+
+    except Exception as e:
+        return f"Yo, HASSAIN AI connection issue: {str(e)[:80]}. I'll be back bro!"
+
+# ============================================================
+# BUILD CONTEXT FOR HASSAIN AI
+# ============================================================
+
+def get_hassain_context():
+    """Gather all ZEUS data for HASSAIN AI to understand"""
+    balance = get_balance()
+    wins = sum(1 for t in paper_history if t["outcome"] == "WIN")
+    losses = len(paper_history) - wins
+    wr = round(wins / max(len(paper_history), 1) * 100, 1)
+    pnl = round(sum(t["pnl"] for t in paper_history), 2)
+    
+    # Best session
+    sessions = {}
+    for s in ["ASIA", "LONDON", "NEW YORK"]:
+        s_trades = [t for t in paper_history if t.get("session") == s]
+        s_wins = sum(1 for t in s_trades if t["outcome"] == "WIN")
+        sessions[s] = round(s_wins / max(len(s_trades), 1) * 100, 1)
+    best_sess = max(sessions, key=sessions.get) if sessions else "Unknown"
+    
+    # Open position info
+    pos_info = "None"
+    if open_position:
+        pos = get_open_pos()
+        if pos:
+            pos_info = f"{open_position['direction']} @ ${open_position['entry']:.1f} | PnL: ${pos['pnl']:.2f}"
+    
+    # Get current market
+    m = get_market_data()
+    
+    return {
+        "balance": balance,
+        "total_trades": len(paper_history),
+        "wins": wins,
+        "losses": losses,
+        "win_rate": wr,
+        "pnl": pnl,
+        "open_pos": pos_info,
+        "price": m.get("price", 0),
+        "session": m.get("session", "Unknown"),
+        "experience": get_experience(),
+        "mistakes": get_mistakes() if mistake_log else "None yet!",
+        "best_session": best_sess,
+    }
+
+# ============================================================
+# GROQ — FAST MODEL ONLY
+# ============================================================
+
+def call_groq(system, user, max_tokens=300):
+    try:
+        r = requests.post(
+            "https://api.groq.com/openai/v1/chat/completions",
+            headers={
+                "Authorization": f"Bearer {GROQ_API_KEY}",
+                "Content-Type": "application/json"
+            },
+            json={
+                "model": MODEL,
+                "messages": [
+                    {"role": "system", "content": system},
+                    {"role": "user", "content": user}
+                ],
+                "max_tokens": max_tokens,
+                "temperature": 0.65
+            },
+            timeout=15)
+        data = r.json()
+        if "error" in data:
+            return f"ERR:{data['error'].get('message','?')[:40]}"
+        return data["choices"][0]["message"]["content"]
+    except Exception as e:
+        return f"ERR:{str(e)[:40]}"
+
+# ============================================================
+# BINANCE TESTNET
+# ============================================================
+
+def get_ts():
+    return int(time.time() * 1000)
+
+def sign(params):
+    query = "&".join([f"{k}={v}" for k, v in params.items()])
+    sig = hmac.new(
+        TESTNET_SECRET.encode(),
+        query.encode(),
+        hashlib.sha256
+    ).hexdigest()
+    params["signature"] = sig
+    return params
+
+def tget(endpoint, params={}):
+    try:
+        params["timestamp"] = get_ts()
+        params = sign(params)
+        r = requests.get(
+            f"{TESTNET_URL}{endpoint}",
+            headers={"X-MBX-APIKEY": TESTNET_API_KEY},
+            params=params, timeout=10)
+        return r.json()
+    except Exception as e:
+        print(f"GET error: {e}")
+        return {}
+
+def tpost(endpoint, params={}):
+    try:
+        params["timestamp"] = get_ts()
+        params = sign(params)
+        r = requests.post(
+            f"{TESTNET_URL}{endpoint}",
+            headers={"X-MBX-APIKEY": TESTNET_API_KEY},
+            params=params, timeout=10)
+        return r.json()
+    except Exception as e:
+        print(f"POST error: {e}")
+        return {}
+
+def get_balance():
+    result = tget("/fapi/v2/balance")
+    if isinstance(result, list):
+        for a in result:
+            if a.get("asset") == "USDT":
+                return float(a.get("availableBalance", 0))
+    return 0.0
+
+def get_open_pos():
+    result = tget("/fapi/v2/positionRisk", {"symbol": SYMBOL})
+    if isinstance(result, list):
+        for pos in result:
+            if pos.get("symbol") == SYMBOL:
+                amt = float(pos.get("positionAmt", 0))
+                if amt != 0:
+                    return {
+                        "direction": "LONG" if amt > 0 else "SHORT",
+                        "qty": abs(amt),
+                        "entry": float(pos.get("entryPrice", 0)),
+                        "pnl": float(pos.get("unRealizedProfit", 0)),
+                    }
+    return None
+
+def open_trade(direction, price, sl, tp1, tp2):
+    global open_position
+    balance = get_balance()
+    if balance < 10:
+        print("  Not enough balance!")
+        return False
+    qty = round((TRADE_USDT * LEVERAGE) / price, 3)
+    if qty < 0.001:
+        qty = 0.001
+    side = "BUY" if direction == "LONG" else "SELL"
+    order = tpost("/fapi/v1/order", {
+        "symbol": SYMBOL, "side": side,
+        "type": "MARKET", "quantity": qty,
+    })
+    if "orderId" not in str(order):
+        return False
+    time.sleep(1)
+    tpost("/fapi/v1/leverage", {"symbol": SYMBOL, "leverage": LEVERAGE})
+    close = "SELL" if direction == "LONG" else "BUY"
+    tpost("/fapi/v1/order", {
+        "symbol": SYMBOL, "side": close,
+        "type": "STOP_MARKET", "quantity": qty,
+        "stopPrice": round(sl, 2),
+        "reduceOnly": "true", "timeInForce": "GTC",
+    })
+    tpost("/fapi/v1/order", {
+        "symbol": SYMBOL, "side": close,
+        "type": "TAKE_PROFIT_MARKET",
+        "quantity": round(qty * 0.5, 3),
+        "stopPrice": round(tp1, 2),
+        "reduceOnly": "true", "timeInForce": "GTC",
+    })
+    tpost("/fapi/v1/order", {
+        "symbol": SYMBOL, "side": close,
+        "type": "TAKE_PROFIT_MARKET",
+        "quantity": round(qty * 0.5, 3),
+        "stopPrice": round(tp2, 2),
+        "reduceOnly": "true", "timeInForce": "GTC",
+    })
+    open_position = {
+        "direction": direction,
+        "entry": price,
+        "sl": sl, "tp1": tp1, "tp2": tp2,
+        "qty": qty,
+        "time": datetime.now().strftime("%Y-%m-%d %H:%M"),
+        "session": get_session(),
+    }
+    print(f"  TRADE: {direction} @ ${price:.2f}")
+    return True
+
+def check_position():
+    global open_position, trades_since_last_msg
+    if not open_position:
+        return
+    pos = get_open_pos()
+    if pos is None:
+        pnl = 0.0
+        try:
+            trades = tget("/fapi/v1/userTrades",
+                          {"symbol": SYMBOL, "limit": 10})
+            if isinstance(trades, list) and trades:
+                pnl = sum(float(t.get("realizedPnl", 0))
+                          for t in trades[-6:])
+        except:
+            pass
+        outcome = "WIN" if pnl >= 0 else "LOSS"
+        if outcome == "LOSS":
+            log_mistake(
+                open_position["direction"],
+                f"SL hit ${open_position['sl']:.2f} "
+                f"entry=${open_position['entry']:.2f} "
+                f"session={open_position['session']}")
+        paper_history.append({
+            "direction": open_position["direction"],
+            "entry": open_position["entry"],
+            "exit": 0,
+            "pnl": round(pnl, 2),
+            "outcome": outcome,
+            "session": open_position["session"],
+            "time": open_position["time"],
+        })
+        trade_memory.append({
+            "direction": open_position["direction"],
+            "outcome": outcome,
+            "session": open_position["session"],
+        })
+        wins = sum(1 for t in paper_history if t["outcome"] == "WIN")
+        losses = len(paper_history) - wins
+        wr = round(wins / len(paper_history) * 100, 1)
+        total = round(sum(t["pnl"] for t in paper_history), 2)
+        emoji = "🏆" if outcome == "WIN" else "❌"
+        send_telegram(
+            f"{emoji} <b>TRADE CLOSED</b>\n"
+            f"━━━━━━━━━━━━━━━━━━\n"
+            f"Result: <b>{outcome}</b>\n"
+            f"PnL: <b>${round(pnl, 2)}</b>\n"
+            f"Total PnL: ${total}\n"
+            f"WR: {wr}% | {wins}W/{losses}L\n"
+            f"[TESTNET FAKE MONEY]")
+        trades_since_last_msg += 1
+        open_position = None
+
+# ============================================================
+# EXPERIENCE
+# ============================================================
+
+def get_experience():
+    diff = datetime.now() - BOT_START_TIME
+    total_s = int(diff.total_seconds())
+    days = diff.days
+    hours = (total_s % 86400) // 3600
+    mins = (total_s % 3600) // 60
+    if days >= 365:
+        return f"{days // 365}y {days % 365}d"
+    elif days >= 7:
+        return f"{days // 7}w {days % 7}d"
+    elif days >= 1:
+        return f"{days}d {hours}h"
+    elif hours >= 1:
+        return f"{hours}h {mins}m"
+    else:
+        return f"{mins}m"
+
+# ============================================================
+# NEWS
+# ============================================================
+
+def get_crypto_news():
+    try:
+        r = requests.get(
+            "https://newsapi.org/v2/everything",
+            params={
+                "q": "ethereum OR ETH crypto",
+                "apiKey": NEWS_API_KEY,
+                "pageSize": 3,
+                "sortBy": "publishedAt",
+                "language": "en"
+            }, timeout=10)
+        articles = r.json().get("articles", [])
+        headlines = [
+            a.get("title", "")[:60]
+            for a in articles[:3]
+            if a.get("title", "") and a.get("title", "") != "[Removed]"
+        ]
+        return " | ".join(headlines) if headlines else "No news"
+    except:
+        return "News failed"
+
+# ============================================================
+# MARKET DATA
+# ============================================================
+
+def get_klines(interval, limit):
+    try:
+        r = requests.get(
+            "https://fapi.binance.com/fapi/v1/klines",
+            params={"symbol": SYMBOL, "interval": interval, "limit": limit},
+            timeout=10)
+        return [{"o": float(c[1]), "h": float(c[2]),
+                 "l": float(c[3]), "c": float(c[4]),
+                 "v": float(c[5])} for c in r.json()]
+    except:
+        return []
+
+def calc_ema(closes, p):
+    if not closes:
+        return 0
+    k = 2 / (p + 1)
+    ema = closes[0]
+    for x in closes[1:]:
+        ema = x * k + ema * (1 - k)
+    return round(ema, 2)
+
+def calc_rsi(closes, p=14):
+    if len(closes) < p + 1:
+        return 50
+    g = [max(closes[i] - closes[i - 1], 0) for i in range(1, len(closes))]
+    l = [max(closes[i - 1] - closes[i], 0) for i in range(1, len(closes))]
+    ag = sum(g[-p:]) / p
+    al = sum(l[-p:]) / p
+    return round(100 - 100 / (1 + ag / al), 1) if al > 0 else 100
+
+def calc_macd(closes):
+    if len(closes) < 26:
+        return 0, 0
+    e12 = calc_ema(closes, 12)
+    e26 = calc_ema(closes, 26)
+    macd = e12 - e26
+    sig = macd * 0.2 + (e12 - e26) * 0.8
+    return round(macd, 4), round(macd - sig, 4)
+
+def calc_vwap(candles):
+    tv = sum(c["v"] for c in candles)
+    if tv == 0:
+        return 0
+    return round(sum(c["c"] * c["v"] for c in candles) / tv, 2)
+
+def detect_fvg(candles):
+    fvgs = []
+    for i in range(len(candles) - 2):
+        c1, c2, c3 = candles[i], candles[i + 1], candles[i + 2]
+        if c3["l"] > c1["h"]:
+            fvgs.append(f"BullFVG {c1['h']:.1f}-{c3['l']:.1f}")
+        elif c3["h"] < c1["l"]:
+            fvgs.append(f"BearFVG {c3['h']:.1f}-{c1['l']:.1f}")
+    return fvgs[-2:] if fvgs else ["None"]
+
+def detect_ob(candles):
+    obs = []
+    for i in range(2, len(candles) - 1):
+        c, n = candles[i], candles[i + 1]
+        if c["c"] < c["o"] and n["c"] > n["o"]:
+            if (n["c"] - n["o"]) > (n["h"] - n["l"]) * 0.5:
+                obs.append(f"BullOB {c['l']:.1f}-{c['h']:.1f}")
+        elif c["c"] > c["o"] and n["c"] < n["o"]:
+            if (n["o"] - n["c"]) > (n["h"] - n["l"]) * 0.5:
+                obs.append(f"BearOB {c['l']:.1f}-{c['h']:.1f}")
+    return obs[-2:] if obs else ["None"]
+
+def detect_sweep(candles):
+    if len(candles) < 5:
+        return "None"
+    highs = [c["h"] for c in candles[-10:]]
+    lows = [c["l"] for c in candles[-10:]]
+    last = candles[-1]
+    ph = max(highs[:-1])
+    pl = min(lows[:-1])
+    if last["h"] > ph and last["c"] < ph:
+        return f"Bear sweep {ph:.1f}"
+    elif last["l"] < pl and last["c"] > pl:
+        return f"Bull sweep {pl:.1f}"
+    return "None"
+
+def get_session():
+    h = datetime.utcnow().hour
+    if 2 <= h < 9:
+        return "ASIA"
+    elif 7 <= h < 12:
+        return "LONDON"
+    elif 12 <= h < 21:
+        return "NEW YORK"
+    else:
+        return "OFF-HOURS"
+
+def get_market_data():
+    try:
+        r = requests.get(
+            "https://fapi.binance.com/fapi/v1/ticker/price",
+            params={"symbol": SYMBOL}, timeout=10)
+        price = float(r.json()["price"])
+    except:
+        price = 0.0
+    try:
+        r = requests.get(
+            "https://fapi.binance.com/fapi/v1/premiumIndex",
+            params={"symbol": SYMBOL}, timeout=10)
+        funding = float(r.json().get("lastFundingRate", 0)) * 100
+    except:
+        funding = 0.0
+    try:
+        r = requests.get(
+            "https://fapi.binance.com/fapi/v1/openInterest",
+            params={"symbol": SYMBOL}, timeout=10)
+        oi = float(r.json().get("openInterest", 0))
+    except:
+        oi = 0.0
+    try:
+        r = requests.get(
+            "https://fapi.binance.com/fapi/v1/ticker/24hr",
+            params={"symbol": SYMBOL}, timeout=10)
+        chg24 = float(r.json().get("priceChangePercent", 0))
+    except:
+        chg24 = 0.0
+
+    k4h = get_klines("4h", 30)
+    k30m = get_klines("30m", 30)
+    k15m = get_klines("15m", 20)
+    k3m = get_klines("3m", 15)
+
+    def summary(candles, label):
+        if len(candles) < 5:
+            return f"{label}: no data"
+        closes = [c["c"] for c in candles]
+        e200 = calc_ema(closes, min(200, len(closes)))
+        rsi = calc_rsi(closes)
+        vwap = calc_vwap(candles)
+        pos = "Above" if closes[-1] > e200 else "Below"
+        trend = "UP" if closes[-1] > closes[-5] else "DOWN"
+        return (f"{label} P={closes[-1]:.1f} "
+                f"E200={e200:.1f}({pos}) "
+                f"RSI={rsi} VWAP={vwap} T={trend}")
+
+    oi_trend = "FLAT"
+    if len(k4h) >= 3:
+        if k4h[-1]["v"] > k4h[-3]["v"] * 1.1:
+            oi_trend = "RISING"
+        elif k4h[-1]["v"] < k4h[-3]["v"] * 0.9:
+            oi_trend = "FALLING"
+
+    news = get_crypto_news()
+    return {
+        "price": price, "funding": funding,
+        "oi": oi, "chg24": chg24,
+        "session": get_session(),
+        "oi_trend": oi_trend,
+        "4h": summary(k4h, "4H"),
+        "30m": summary(k30m, "30M"),
+        "15m": summary(k15m, "15M"),
+        "3m": summary(k3m, "3M"),
+        "fvg": ", ".join(detect_fvg(k30m)),
+        "ob": ", ".join(detect_ob(k30m)),
+        "sweep": detect_sweep(k30m),
+        "fvg_4h": ", ".join(detect_fvg(k4h)),
+        "ob_4h": ", ".join(detect_ob(k4h)),
+        "news": news,
+        "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M"),
+    }
+
+# ============================================================
+# MISTAKE MEMORY
+# ============================================================
+
+def get_mistakes():
+    if not mistake_log:
+        return "None yet."
+    return " | ".join([f"{m['direction']}:{m['reason'][:25]}"
+                       for m in mistake_log[-2:]])
+
+def log_mistake(direction, reason):
+    mistake_log.append({
+        "time": datetime.now().strftime("%Y-%m-%d %H:%M"),
+        "direction": direction,
+        "reason": reason,
+    })
+    if len(mistake_log) > 50:
+        mistake_log[:] = mistake_log[-50:]
+
+# ============================================================
+# 5 GROQ AIs + 3 LOGIC AIs + 1 SUPER LOGIC AI9
+# ============================================================
+
+def ai1_macro(m):
+    global ai_status
+    sys = "World macro analyst. Regime + direction. Be fast and decisive."
+    p = f"""Price={m['price']:.2f} Funding={m['funding']:.4f}%
+OI={m['oi_trend']} 24h={m['chg24']:.2f}% Session={m['session']}
+{m['4h']} NEWS:{m['news'][:60]}
+MISTAKES:{get_mistakes()[:60]}
+
+OUTPUT:
+REGIME:[Trend/Chop/Shock]
+DIRECTION:[LONG/SHORT/NONE]
+CONFIDENCE:[0-100]%"""
+    result = call_groq(sys, p, 150)
+    ai_status["AI1"] = "✅" if "ERR" not in result else "❌"
+    return result
+
+def ai2_technicals(m):
+    global ai_status
+    closes_4h = []
+    try:
+        k = get_klines("4h", 20)
+        closes_4h = [c["c"] for c in k]
+    except:
+        pass
+    closes_30m = []
+    try:
+        k = get_klines("30m", 20)
+        closes_30m = [c["c"] for c in k]
+    except:
+        pass
+
+    rsi_4h  = calc_rsi(closes_4h)  if closes_4h  else 50
+    rsi_30m = calc_rsi(closes_30m) if closes_30m else 50
+    ema_4h  = calc_ema(closes_4h, 20)  if closes_4h  else m["price"]
+
+    direction = "NONE"
+    confidence = 50
+
+    if rsi_4h > 55 and m["price"] > ema_4h:
+        direction = "LONG"
+        confidence = min(90, int(rsi_4h))
+    elif rsi_4h < 45 and m["price"] < ema_4h:
+        direction = "SHORT"
+        confidence = min(90, int(100 - rsi_4h))
+
+    sl = round(m["price"] * 0.992, 1) if direction == "LONG" else round(m["price"] * 1.008, 1)
+    tp1 = round(m["price"] * 1.013, 1) if direction == "LONG" else round(m["price"] * 0.987, 1)
+    tp2 = round(m["price"] * 1.026, 1) if direction == "LONG" else round(m["price"] * 0.974, 1)
+
+    result = (f"DIRECTION:{direction}\n"
+              f"ENTRY:${m['price']:.1f}\n"
+              f"SL:${sl}\nTP1:${tp1}\nTP2:${tp2}\n"
+              f"RSI_4H:{rsi_4h} RSI_30M:{rsi_30m}\n"
+              f"CONFIDENCE:{confidence}%")
+    ai_status["AI2"] = "✅"
+    return result
+
+def ai3_confluence(m, ai1, ai2):
+    global ai_status
+    sys = "Confluence validator. Multi-TF alignment. RR min 1:2."
+    p = f"""AI1:{ai1[:100]}
+AI2:{ai2[:100]}
+{m['4h']} {m['30m']}
+FVG={m['fvg']} OB={m['ob']}
+Price={m['price']:.2f} Session={m['session']}
+KillZone={'YES' if get_session() in ['LONDON','NEW YORK'] else 'NO'}
+
+OUTPUT:
+ALIGNED:[YES/NO]
+DIRECTION:[LONG/SHORT/NONE]
+ENTRY:[$price]
+SL:[$price]
+TP1:[$price]
+TP2:[$price]
+VERDICT:[TRADE/SKIP]"""
+    result = call_groq(sys, p, 150)
+    ai_status["AI3"] = "✅" if "ERR" not in result else "❌"
+    return result
+
+def ai4_risk(m):
+    global ai_status
+    recent = trade_memory[-5:] if trade_memory else []
+    cons = 0
+    for t in reversed(recent):
+        if t.get("outcome") == "LOSS":
+            cons += 1
+        else:
+            break
+
+    pause = "NO"
+    reason = "OK"
+    approved = "YES"
+
+    if cons >= 2:
+        pause = "YES"
+        reason = "2+ consecutive losses"
+        approved = "NO"
+    elif abs(m["funding"]) > 0.05:
+        pause = "YES"
+        reason = "Extreme funding"
+        approved = "NO"
+    elif m["session"] == "OFF-HOURS":
+        reason = "Off-hours caution"
+
+    result = (f"PAUSE:{pause}\n"
+              f"APPROVED:{approved}\n"
+              f"CONS_LOSSES:{cons}\n"
+              f"REASON:{reason}")
+    ai_status["AI4"] = "✅"
+    return result
+
+def ai5_smart_money(m, ai1):
+    global ai_status
+    sys = "Smart money tracker. Whale movements. Institutional flow."
+    p = f"""AI1:{ai1[:80]}
+Funding={m['funding']:.4f}% OI={m['oi_trend']}
+Price={m['price']:.2f} 24h={m['chg24']:.2f}%
+
+OUTPUT:
+SMART_MONEY:[Bull/Bear/Neutral]
+WHALE:[Accumulating/Distributing/Neutral]
+DIRECTION:[LONG/SHORT/NONE]
+SQUEEZE:[YES/NO]"""
+    result = call_groq(sys, p, 120)
+    ai_status["AI5"] = "✅" if "ERR" not in result else "❌"
+    return result
+
+def ai6_rl_coach():
+    global ai_status
+    recent = trade_memory[-10:] if trade_memory else []
+    wins = sum(1 for t in recent if t.get("outcome") == "WIN")
+    losses = sum(1 for t in recent if t.get("outcome") == "LOSS")
+    wr = round(wins / max(len(recent), 1) * 100, 1)
+
+    session_wins = {}
+    for sess in ["ASIA","LONDON","NEW YORK"]:
+        s_trades = [t for t in trade_memory if t.get("session") == sess]
+        s_wins   = sum(1 for t in s_trades if t.get("outcome") == "WIN")
+        session_wins[sess] = round(s_wins / max(len(s_trades), 1) * 100, 1)
+
+    best_session = max(session_wins, key=session_wins.get) if session_wins else "UNKNOWN"
+
+    direction = "NONE"
+    if wr >= 60:
+        direction = "LONG"
+    elif wr < 40 and len(recent) > 3:
+        direction = "NONE"
+
+    result = (f"WIN_RATE:{wr}%\n"
+              f"WINS:{wins} LOSSES:{losses}\n"
+              f"BEST_SESSION:{best_session}\n"
+              f"DIRECTION:{direction}\n"
+              f"SKILL:{min(100, int(wr))} /100")
+    ai_status["AI6"] = "✅"
+    return result
+
+def ai7_edge_master(m, ai1):
+    global ai_status
+    recent = trade_memory[-20:] if trade_memory else []
+    edge = "Building..."
+    if recent:
+        wins = sum(1 for t in recent if t.get("outcome") == "WIN")
+        wr   = wins / len(recent)
+        exp  = round((wr * 1.5) - ((1 - wr) * 1.0), 3)
+        edge = f"WR={round(wr*100,1)}% Exp={exp}"
+    sys = "Edge master. Positive expectancy only. Fast answer."
+    p = f"""AI1:{ai1[:80]}
+EDGE:{edge}
+Price={m['price']:.2f} Session={m['session']}
+FVG={m['fvg']} Sweep={m['sweep']}
+
+OUTPUT:
+EDGE:[YES/NO]
+SCORE:[0-100]%
+DIRECTION:[LONG/SHORT/NONE]"""
+    result = call_groq(sys, p, 100)
+    ai_status["AI7"] = "✅" if "ERR" not in result else "❌"
+    return result
+
+def ai8_umar(m, ai1):
+    global ai_status
+    sys = """Umar Punjab ICT/SMC expert. OB FVG BOS Kill zones OTE.
+Never against 4H. Wait for sweep. Patience."""
+    p = f"""AI1:{ai1[:80]}
+{m['4h']} {m['30m']}
+FVG={m['fvg']} OB={m['ob']} Sweep={m['sweep']}
+Price={m['price']:.2f} Session={m['session']}
+
+OUTPUT:
+BIAS:[LONG/SHORT/NONE]
+SETUP:[name]
+ENTRY:[$price]
+SL:[$price]
+TP:[$price]
+VERDICT:[TRADE/WAIT/AVOID]"""
+    result = call_groq(sys, p, 120)
+    ai_status["AI8"] = "✅" if "ERR" not in result else "❌"
+    return result
+
+def ai9_super_controller(m, results):
+    global ai_status
+
+    names = ["AI1","AI2","AI3","AI4","AI5","AI6","AI7","AI8"]
+    long_v = short_v = skip_v = 0
+    failed = []
+
+    for i, res in enumerate(results):
+        ok = len(str(res).strip()) > 15 and "ERR" not in str(res)
+        if not ok:
+            failed.append(names[i])
+        txt = str(res).upper()
+        l   = txt.count("LONG") * 2 + txt.count("BULL")
+        s   = txt.count("SHORT") * 2 + txt.count("BEAR")
+        sk  = txt.count("SKIP") + txt.count("WAIT") + txt.count("AVOID")
+        if sk > 2:
+            skip_v  += 1
+        elif l > s:
+            long_v  += 1
+        elif s > l:
+            short_v += 1
+        else:
+            skip_v  += 1
+
+    if failed:
+        send_telegram(f"⚠️ AI9: {', '.join(failed)} failed. Auto backup active.")
+
+    recent = trade_memory[-5:] if trade_memory else []
+    cons = 0
+    for t in reversed(recent):
+        if t.get("outcome") == "LOSS":
+            cons += 1
+        else:
+            break
+
+    block = "NO"
+    block_reason = ""
+
+    if cons >= 2:
+        block = "YES"
+        block_reason = "2+ consecutive losses"
+    if abs(m["funding"]) > 0.05:
+        block = "YES"
+        block_reason = "Extreme funding rate"
+    if "PAUSE:YES" in str(results[3]).upper():
+        block = "YES"
+        block_reason = "AI4 risk pause"
+
+    if long_v > short_v:
+        consensus = "LONG"
+    elif short_v > long_v:
+        consensus = "SHORT"
+    else:
+        consensus = "FLAT"
+
+    verdict = "SKIP"
+    if block == "NO" and max(long_v, short_v) >= 5:
+        verdict = "TRADE"
+    elif block == "NO":
+        verdict = "WAIT"
+
+    discipline = "GOOD"
+    if cons >= 1:
+        discipline = "WARNING"
+    if cons >= 2:
+        discipline = "CRITICAL"
+
+    ai_status["AI9"] = "✅"
+
+    return (f"CONSENSUS:{consensus}\n"
+            f"LONG_VOTES:{long_v} SHORT_VOTES:{short_v}\n"
+            f"DISCIPLINE:{discipline}\n"
+            f"VERDICT:{verdict}\n"
+            f"BLOCK:{block}\n"
+            f"BLOCK_REASON:{block_reason if block_reason else 'None'}\n"
+            f"FAILED:{failed if failed else 'None'}")
+
+# ============================================================
+# AI VOTING
+# ============================================================
+
+def ai_vote(results):
+    lv = sv = skv = 0
+    for res in results:
+        txt = str(res).upper()
+        l   = txt.count("LONG") * 2 + txt.count("BULL")
+        s   = txt.count("SHORT") * 2 + txt.count("BEAR")
+        sk  = txt.count("SKIP") + txt.count("WAIT") + txt.count("AVOID")
+        if sk > 2:
+            skv += 1
+        elif l > s:
+            lv  += 1
+        elif s > l:
+            sv  += 1
+        else:
+            skv += 1
+
+    ai9 = str(results[8]).upper()
+    if "BLOCK:YES" in ai9:
+        return "NONE", 0
+    if "PAUSE:YES" in str(results[3]).upper():
+        return "NONE", 0
+
+    total = lv + sv + skv
+    if total == 0:
+        return "NONE", 0
+    if lv >= 5:
+        return "LONG", round(lv / total * 100)
+    elif sv >= 5:
+        return "SHORT", round(sv / total * 100)
+    else:
+        return "NONE", 0
+
+def get_levels(results, direction, price):
+    def parse(text, key):
+        try:
+            for sep in ["=", ":"]:
+                full = key + sep
+                if full.upper() in text.upper():
+                    idx   = text.upper().index(full.upper())
+                    chunk = text[idx + len(full):idx + len(full) + 15]
+                    d     = "".join(c for c in chunk if c.isdigit() or c == ".")
+                    v     = float(d[:8])
+                    if 100 < v < 100000:
+                        return v
+        except:
+            pass
+        return None
+
+    ai3 = str(results[2])
+    ai8 = str(results[7])
+    entry = parse(ai3, "ENTRY") or parse(ai8, "ENTRY") or price
+    sl    = parse(ai3, "SL")    or parse(ai8, "SL")
+    tp1   = parse(ai3, "TP1")
+    tp2   = parse(ai3, "TP2")   or parse(ai8, "TP")
+
+    if direction == "LONG":
+        sl  = sl  or round(price * 0.9920, 1)
+        tp1 = tp1 or round(price * 1.0130, 1)
+        tp2 = tp2 or round(price * 1.0260, 1)
+    else:
+        sl  = sl  or round(price * 1.0080, 1)
+        tp1 = tp1 or round(price * 0.9870, 1)
+        tp2 = tp2 or round(price * 0.9740, 1)
+
+    rr = round(abs(tp2 - entry) / abs(sl - entry), 2) if abs(sl - entry) > 0 else 0
+    if rr < 1.5:
+        return None
+    return {"entry": entry, "sl": sl, "tp1": tp1, "tp2": tp2, "rr": rr}
+
+# ============================================================
+# BEAUTIFUL UNIFIED MESSAGE BUILDER
+# ============================================================
+
+def build_status_message(m, results, direction, vote_pct, levels):
+    wins    = sum(1 for t in paper_history if t["outcome"] == "WIN")
+    losses  = len(paper_history) - wins
+    wr      = round(wins / max(len(paper_history), 1) * 100, 1)
+    pnl     = round(sum(t["pnl"] for t in paper_history), 2)
+    exp     = get_experience()
+    balance = get_balance()
+    st      = "📈" if pnl >= 0 else "📉"
+    t_now   = datetime.now().strftime("%H:%M")
+
+    ai_row = (f"AI1{ai_status['AI1']} AI2{ai_status['AI2']} AI3{ai_status['AI3']}\n"
+              f"AI4{ai_status['AI4']} AI5{ai_status['AI5']} AI6{ai_status['AI6']}\n"
+              f"AI7{ai_status['AI7']} AI8{ai_status['AI8']} AI9{ai_status['AI9']}")
+
+    sess_emoji = {"ASIA": "🌏", "LONDON": "🇬🇧",
+                  "NEW YORK": "🗽", "OFF-HOURS": "🌙"}
+    s_emoji = sess_emoji.get(m["session"], "🌐")
+
+    if direction == "LONG":
+        dir_line = f"🟢 <b>LONG ▲</b> — {vote_pct}% confidence"
+    elif direction == "SHORT":
+        dir_line = f"🔴 <b>SHORT ▼</b> — {vote_pct}% confidence"
+    else:
+        dir_line = "⚪ <b>NO TRADE</b> — Waiting for setup"
+
+    pos_line = "None"
+    if open_position:
+        pos = get_open_pos()
+        lpnl = pos["pnl"] if pos else 0
+        p_emoji = "📈" if lpnl >= 0 else "📉"
+        pos_line = (f"{open_position['direction']} "
+                    f"@ ${open_position['entry']:.1f} "
+                    f"{p_emoji}${lpnl:.2f}")
+
+    levels_line = ""
+    if levels and direction != "NONE":
+        levels_line = (f"\n💰 Entry: <b>${levels['entry']:.1f}</b>\n"
+                       f"🛑 SL: ${levels['sl']:.1f}\n"
+                       f"🎯 TP1: ${levels['tp1']:.1f}\n"
+                       f"🎯 TP2: ${levels['tp2']:.1f}\n"
+                       f"📐 R:R = 1:{levels['rr']}")
+
+    msg = (f"⚡ <b>ZEUS ORACLE v7 • {t_now}</b>\n"
+           f"━━━━━━━━━━━━━━━━━━\n"
+           f"💹 ETH: <b>${m['price']:.2f}</b> "
+           f"{s_emoji} {m['session']} "
+           f"({m['chg24']:+.2f}%)\n"
+           f"━━━━━━━━━━━━━━━━━━\n"
+           f"🤖 <b>AI STATUS</b>\n"
+           f"{ai_row}\n"
+           f"━━━━━━━━━━━━━━━━━━\n"
+           f"🧠 <b>DECISION</b>\n"
+           f"{dir_line}"
+           f"{levels_line}\n"
+           f"━━━━━━━━━━━━━━━━━━\n"
+           f"💼 <b>PORTFOLIO</b>\n"
+           f"Balance: ${balance:.2f}\n"
+           f"PnL: {st} <b>${pnl}</b>\n"
+           f"WR: <b>{wr}%</b> | {wins}W/{losses}L\n"
+           f"Trades(x): {trades_since_last_msg} | (y): {len(paper_history)}\n"
+           f"Experience: {exp}\n"
+           f"Open: {pos_line}\n"
+           f"━━━━━━━━━━━━━━━━━━\n"
+           f"📰 {m['news'][:60]}\n"
+           f"[TESTNET FAKE MONEY]")
+    return msg
+
+# ============================================================
+# TELEGRAM COMMANDS & MESSAGES
+# ============================================================
+
+def check_commands():
+    global last_update_id, trades_since_last_msg
+    try:
+        r = requests.get(
+            f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/getUpdates",
+            params={"offset": last_update_id + 1, "timeout": 5},
+            timeout=10)
+        updates = r.json().get("result", [])
+        for update in updates:
+            last_update_id = update["update_id"]
+            text = update.get("message", {}).get("text", "").strip()
+            
+            if not text:
+                continue
+            
+            # Check for /status command (old style)
+            if text.lower() == "/status":
+                m = get_market_data()
+                r0 = ai1_macro(m)
+                r1 = ai2_technicals(m)
+                r2 = ai3_confluence(m, r0, r1)
+                r3 = ai4_risk(m)
+                r4 = ai5_smart_money(m, r0)
+                r5 = ai6_rl_coach()
+                r6 = ai7_edge_master(m, r0)
+                r7 = ai8_umar(m, r0)
+                r8 = ai9_super_controller(m, [r0,r1,r2,r3,r4,r5,r6,r7])
+                results = [r0,r1,r2,r3,r4,r5,r6,r7,r8]
+                direction, vote_pct = ai_vote(results)
+                levels = get_levels(results, direction, m["price"]) if direction != "NONE" else None
+                msg = build_status_message(m, results, direction, vote_pct, levels)
+                send_telegram(msg)
+                trades_since_last_msg = 0
+            
+            # Check for /mistakes command (old style)
+            elif text.lower() == "/mistakes":
+                if not mistake_log:
+                    send_telegram("✅ No mistakes yet! AIs learning...")
+                else:
+                    lines = ["📚 <b>AI Mistakes Learned:</b>"]
+                    for mk in mistake_log[-5:]:
+                        lines.append(f"❌ {mk['direction']}: {mk['reason'][:50]}")
+                    send_telegram("\n".join(lines))
+            
+            # ANY other message goes to HASSAIN AI
+            else:
+                context = get_hassain_context()
+                response = call_hassain_ai(text, context)
+                send_telegram(f"🤖 <b>HASSAIN AI</b>:\n\n{response}")
+                
+    except Exception as e:
+        print(f"Command error: {e}")
+
+# ============================================================
+# REPORTS
+# ============================================================
+
+def send_daily_report(m):
+    global trades_since_last_msg
+    today = datetime.now().strftime("%Y-%m-%d")
+    td    = [t for t in paper_history if t["time"][:10] == today]
+    wins  = sum(1 for t in paper_history if t["outcome"] == "WIN")
+    losses = len(paper_history) - wins
+    wr    = round(wins / max(len(paper_history), 1) * 100, 1)
+    pnl   = round(sum(t["pnl"] for t in paper_history), 2)
+    st    = "📈" if pnl >= 0 else "📉"
+    bal   = get_balance()
+    ai_row = (f"AI1{ai_status['AI1']} AI2{ai_status['AI2']} "
+              f"AI3{ai_status['AI3']} AI4{ai_status['AI4']}\n"
+              f"AI5{ai_status['AI5']} AI6{ai_status['AI6']} "
+              f"AI7{ai_status['AI7']} AI8{ai_status['AI8']} "
+              f"AI9{ai_status['AI9']}")
+    send_telegram(
+        f"📅 <b>DAILY REPORT — {today}</b>\n"
+        f"━━━━━━━━━━━━━━━━━━\n"
+        f"🤖 AI STATUS:\n{ai_row}\n"
+        f"━━━━━━━━━━━━━━━━━━\n"
+        f"⏱ Experience: {get_experience()}\n"
+        f"📊 Today trades: {len(td)}\n"
+        f"💰 Balance: ${bal:.2f}\n"
+        f"💹 Total PnL: {st} <b>${pnl}</b>\n"
+        f"🎯 WR: <b>{wr}%</b> | {wins}W/{losses}L\n"
+        f"📈 Total trades(y): {len(paper_history)}\n"
+        f"📚 Mistakes learned: {len(mistake_log)}\n"
+        f"━━━━━━━━━━━━━━━━━━\n"
+        f"[TESTNET FAKE MONEY]")
+    trades_since_last_msg = 0
+
+def send_monthly_report():
+    month  = datetime.now().strftime("%B %Y")
+    wins   = sum(1 for t in paper_history if t["outcome"] == "WIN")
+    losses = len(paper_history) - wins
+    wr     = round(wins / max(len(paper_history), 1) * 100, 1)
+    pnl    = round(sum(t["pnl"] for t in paper_history), 2)
+    st     = "📈" if pnl >= 0 else "📉"
+    best   = max((t["pnl"] for t in paper_history), default=0)
+    worst  = min((t["pnl"] for t in paper_history), default=0)
+    bal    = get_balance()
+    ses    = ["ASIA","LONDON","NEW YORK"]
+    ss     = {}
+    for s in ses:
+        st2 = [t for t in paper_history if t.get("session") == s]
+        sw  = sum(1 for t in st2 if t["outcome"] == "WIN")
+        ss[s] = round(sw / max(len(st2), 1) * 100, 1)
+    best_ses = max(ss, key=ss.get)
+    send_telegram(
+        f"🏆 <b>MONTHLY REPORT — {month}</b>\n"
+        f"━━━━━━━━━━━━━━━━━━\n"
+        f"⏱ Experience: {get_experience()}\n"
+        f"💰 Balance: ${bal:.2f}\n"
+        f"💹 PnL: {st} <b>${pnl}</b>\n"
+        f"📊 Trades: {len(paper_history)}\n"
+        f"🎯 WR: <b>{wr}%</b> | {wins}W/{losses}L\n"
+        f"🏅 Best: +${best:.2f} | Worst: ${worst:.2f}\n"
+        f"━━━━━━━━━━━━━━━━━━\n"
+        f"🌍 SESSIONS\n"
+        f"🌏 ASIA: {ss['ASIA']}%\n"
+        f"🇬🇧 LONDON: {ss['LONDON']}%\n"
+        f"🗽 NEW YORK: {ss['NEW YORK']}%\n"
+        f"🏆 Best: <b>{best_ses}</b>\n"
+        f"━━━━━━━━━━━━━━━━━━\n"
+        f"📚 Mistakes learned: {len(mistake_log)}\n"
+        f"{'✅ GREAT MONTH BRO!' if pnl > 0 else '📚 Keep learning!'}\n"
+        f"[TESTNET FAKE MONEY]")
+
+# ============================================================
+# MAIN CYCLE
+# ============================================================
+
+def run_cycle():
+    global cycle_count, last_daily_reported, last_monthly_reported
+
+    cycle_count += 1
+    print(f"\n{'='*40}")
+    print(f"CYCLE #{cycle_count}: {datetime.now().strftime('%Y-%m-%d %H:%M')}")
+    print(f"{'='*40}")
+
+    check_commands()
+    check_position()
+
+    print("Fetching market...")
+    m = get_market_data()
+    if m["price"] == 0:
+        print("No price. Skipping.")
+        return
+    print(f"ETH=${m['price']:.2f} | {m['session']}")
+
+    if open_position:
+        pos = get_open_pos()
+        if pos:
+            print(f"  Position open: {pos['direction']} PnL=${pos['pnl']:.2f}")
+        return
+
+    print("Running AIs...")
+    results = [None] * 9
+
+    print("  AI1 Macro...",   end=" ", flush=True)
+    results[0] = ai1_macro(m)
+    print(ai_status["AI1"]); time.sleep(5)
+
+    print("  AI2 Tech...",    end=" ", flush=True)
+    results[1] = ai2_technicals(m)
+    print(ai_status["AI2"]); time.sleep(2)
+
+    print("  AI3 Conf...",    end=" ", flush=True)
+    results[2] = ai3_confluence(m, results[0], results[1])
+    print(ai_status["AI3"]); time.sleep(5)
+
+    print("  AI4 Risk...",    end=" ", flush=True)
+    results[3] = ai4_risk(m)
+    print(ai_status["AI4"]); time.sleep(2)
+
+    print("  AI5 Smart...",   end=" ", flush=True)
+    results[4] = ai5_smart_money(m, results[0])
+    print(ai_status["AI5"]); time.sleep(5)
+
+    print("  AI6 RL...",      end=" ", flush=True)
+    results[5] = ai6_rl_coach()
+    print(ai_status["AI6"]); time.sleep(2)
+
+    print("  AI7 Edge...",    end=" ", flush=True)
+    results[6] = ai7_edge_master(m, results[0])
+    print(ai_status["AI7"]); time.sleep(5)
+
+    print("  AI8 Umar...",    end=" ", flush=True)
+    results[7] = ai8_umar(m, results[0])
+    print(ai_status["AI8"]); time.sleep(2)
+
+    print("  AI9 Logic...",   end=" ", flush=True)
+    results[8] = ai9_super_controller(m, results[:8])
+    print(ai_status["AI9"])
+
+    direction, vote_pct = ai_vote(results)
+    print(f"  Vote: {direction} {vote_pct}%")
+
+    if direction != "NONE" and vote_pct >= MIN_VOTE_PCT:
+        levels = get_levels(results, direction, m["price"])
+        if levels:
+            success = open_trade(
+                direction, m["price"],
+                levels["sl"], levels["tp1"], levels["tp2"])
+            if success:
+                msg = build_status_message(m, results, direction, vote_pct, levels)
+                send_telegram(msg)
+    else:
+        print("  No trade this cycle")
+        levels = None
+
+    now        = datetime.now()
+    today      = now.strftime("%Y-%m-%d")
+    this_month = now.strftime("%Y-%m")
+    hour       = now.hour
+    day        = now.day
+    last_day   = calendar.monthrange(now.year, now.month)[1]
+
+    if hour == 20 and last_daily_reported != today:
+        last_daily_reported = today
+        send_daily_report(m)
+
+    if day == last_day and hour == 20 and last_monthly_reported != this_month:
+        last_monthly_reported = this_month
+        send_monthly_report()
+
+    del results
+    gc.collect()
+    print(f"Done. Next in {INTERVAL_MINUTES}min.")
+
+# ============================================================
+# MAIN
+# ============================================================
+
+def main():
+    bal = get_balance()
+    send_telegram(
+        f"⚡ <b>ZEUS ORACLE v7 + HASSAIN AI — LIVE</b>\n"
+        f"━━━━━━━━━━━━━━━━━━\n"
+        f"🤖 5 Groq AIs + 4 Logic AIs\n"
+        f"🧠 AI9: Pure Logic — Never fails!\n"
+        f"💬 HASSAIN AI: Your trading partner & best friend\n"
+        f"💰 Balance: ${bal:.2f}\n"
+        f"📊 Every {INTERVAL_MINUTES}min silent trading\n"
+        f"📅 Daily report: 8PM\n"
+        f"━━━━━━━━━━━━━━━━━━\n"
+        f"💬 JUST CHAT NATURALLY:\n"
+        f"'Why no trades?' → AI explains\n"
+        f"'Show balance' → AI shows status\n"
+        f"'Any questions?'\n"
+        f"━━━━━━━━━━━━━━━━━━\n"
+        f"[TESTNET FAKE MONEY ONLY]\n"
+        f"Started: {datetime.now().strftime('%Y-%m-%d %H:%M')}")
+    print("ZEUS ORACLE v7 + HASSAIN AI started!")
+    print("Natural chat enabled - talk like friends!")
+
+    while True:
+        try:
+            run_cycle()
+            time.sleep(INTERVAL_MINUTES * 60)
+        except KeyboardInterrupt:
+            send_telegram("🛑 Zeus + HASSAIN AI stopped.")
+            if paper_history:
+                send_monthly_report()
+            print("Stopped.")
+            break
+        except MemoryError:
+            gc.collect()
+            send_telegram("⚠️ Memory cleared. Restart 2min...")
+            time.sleep(120)
+        except Exception as e:
+            print(traceback.format_exc()[-200:])
+            gc.collect()
+            time.sleep(60)
+
+if __name__ == "__main__":
+    main()
